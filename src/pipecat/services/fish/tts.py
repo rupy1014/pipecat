@@ -280,12 +280,18 @@ class FishAudioTTSService(InterruptibleTTSService):
                         event = msg.get("event")
                         if event == "audio":
                             audio_data = msg.get("audio")
-                            # Only process larger chunks to remove msgpack overhead
-                            if audio_data and len(audio_data) > 1024:
+                            if audio_data and len(audio_data) > 0:
                                 frame = TTSAudioRawFrame(audio_data, self.sample_rate, 1)
                                 await self.push_frame(frame)
                                 await self.stop_ttfb_metrics()
                                 continue
+                        elif event == "finish":
+                            reason = msg.get("reason")
+                            err_msg = msg.get("message")
+                            if reason == "error":
+                                logger.error(
+                                    f"{self}: Fish Audio error: {err_msg}"
+                                )
 
             except Exception as e:
                 await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
