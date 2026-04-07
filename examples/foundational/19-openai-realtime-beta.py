@@ -86,9 +86,8 @@ restaurant_function = FunctionSchema(
 tools = ToolsSchema(standard_tools=[weather_function, restaurant_function])
 
 
-# We store functions so objects (e.g. SileroVADAnalyzer) don't get
-# instantiated. The function will be called when the desired transport gets
-# selected.
+# We use lambdas to defer transport parameter creation until the transport
+# type is selected at runtime.
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
@@ -156,7 +155,7 @@ Remember, your responses should be short. Just one or two sentences, usually. Re
     # OpenAIRealtimeBetaLLMService will convert this internally to messages that the
     # openai WebSocket API can understand.
     context = OpenAILLMContext(
-        [{"role": "user", "content": "Say hello!"}],
+        [{"role": "developer", "content": "Say hello!"}],
         tools,
     )
 

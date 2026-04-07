@@ -15,6 +15,7 @@ import contextlib
 import functools
 import inspect
 import json
+from multiprocessing import Value
 from typing import TYPE_CHECKING, Callable, Optional, TypeVar
 
 from loguru import logger
@@ -28,10 +29,6 @@ if TYPE_CHECKING:
 
 from pipecat.processors.aggregators.llm_context import NOT_GIVEN, LLMContext
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.utils.tracing.context_registry import (
-    get_current_conversation_context,
-    get_current_turn_context,
-)
 from pipecat.utils.tracing.service_attributes import (
     add_gemini_live_span_attributes,
     add_llm_span_attributes,
@@ -49,6 +46,67 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 
+def _get_model_name(service) -> str:
+    """Get the model name from a service instance.
+
+    This is a bit of a mess — there were multiple places a model name could live.
+    Soon, self._settings should be the only source of truth about model name.
+    In fact...it might already be the case, but juuuuust to be safe, we'll
+    check all the places we used to store it.
+    """
+    return (
+        # Some services store an API-response-provided detailed "full" name,
+        # which is distinct from the user-provided model name
+        getattr(service, "_full_model_name", None)
+        or getattr(getattr(service, "_settings", None), "model", None)
+        or getattr(service, "model_name", None)
+        or getattr(service, "_model_name", None)
+        or "unknown"
+    )
+
+
+def _strip_thought_from_id(value):
+    """Strip __thought__ suffix and its encoded content from tool call IDs.
+
+    Some models (e.g., Gemini) append thought/reasoning content to tool call IDs
+    using __thought__ as a delimiter (e.g., ``call_abc__thought__<base64>``).
+    """
+    if not value or not isinstance(value, str) or "__thought__" not in value:
+        return value
+    return value.split("__thought__", 1)[0]
+
+
+def _strip_thought_ids_from_messages(messages):
+    """Strip __thought__ suffixes from tool_call_id fields in traced messages.
+
+    Cleans both tool-role messages (tool_call_id) and assistant-role messages
+    (id inside each entry of tool_calls).
+    """
+    if not messages:
+        return messages
+    cleaned = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
+        # Tool result messages: {role: "tool", tool_call_id: "..."}
+        if "tool_call_id" in msg:
+            msg = {**msg, "tool_call_id": _strip_thought_from_id(msg["tool_call_id"])}
+        # Assistant messages with tool_calls: [{id: "...", ...}, ...]
+        if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+            msg = {
+                **msg,
+                "tool_calls": [
+                    {**tc, "id": _strip_thought_from_id(tc.get("id", ""))}
+                    if isinstance(tc, dict) and "id" in tc
+                    else tc
+                    for tc in msg["tool_calls"]
+                ],
+            }
+        cleaned.append(msg)
+    return cleaned
+
+
 def _noop_decorator(func):
     """No-op fallback decorator when tracing is unavailable.
 
@@ -61,10 +119,24 @@ def _noop_decorator(func):
     return func
 
 
+def _get_turn_context(self):
+    """Get the current turn's tracing context if available.
+
+    Args:
+        self: The service instance.
+
+    Returns:
+        The turn context, or None if unavailable.
+    """
+    tracing_ctx = getattr(self, "_tracing_context", None)
+    return tracing_ctx.get_turn_context() if tracing_ctx else None
+
+
 def _get_parent_service_context(self):
     """Get the parent service span context (internal use only).
 
-    This looks for the service span that was created when the service was initialized.
+    This looks for the service span that was created when the service was initialized,
+    or falls back to the conversation context if available.
 
     Args:
         self: The service instance.
@@ -75,11 +147,18 @@ def _get_parent_service_context(self):
     if not is_tracing_available():
         return None
 
-    # The parent span was created when Traceable was initialized and stored as self._span
+    # TODO: Remove this block and delete class_decorators.py once Traceable is removed.
+    # Legacy: support for classes inheriting from Traceable (currently unused, deprecated).
     if hasattr(self, "_span") and self._span:
         return trace.set_span_in_context(self._span)
 
-    # If we can't find a stored span, default to current context
+    # Use the conversation context set by TurnTraceObserver via TracingContext.
+    tracing_ctx = getattr(self, "_tracing_context", None)
+    conversation_context = tracing_ctx.get_conversation_context() if tracing_ctx else None
+    if conversation_context:
+        return conversation_context
+
+    # Last resort: use current context (may create orphan spans)
     return context_api.get_current()
 
 
@@ -104,14 +183,14 @@ def _add_token_usage_to_span(span, token_usage):
             and token_usage["cache_read_input_tokens"] is not None
         ):
             span.set_attribute(
-                "gen_ai.usage.cache_read_input_tokens", token_usage["cache_read_input_tokens"]
+                "gen_ai.usage.cache_read.input_tokens", token_usage["cache_read_input_tokens"]
             )
         if (
             "cache_creation_input_tokens" in token_usage
             and token_usage["cache_creation_input_tokens"] is not None
         ):
             span.set_attribute(
-                "gen_ai.usage.cache_creation_input_tokens",
+                "gen_ai.usage.cache_creation.input_tokens",
                 token_usage["cache_creation_input_tokens"],
             )
         if "reasoning_tokens" in token_usage and token_usage["reasoning_tokens"] is not None:
@@ -126,11 +205,11 @@ def _add_token_usage_to_span(span, token_usage):
         # Add cached token metrics for LLMTokenUsage object
         cache_read_tokens = getattr(token_usage, "cache_read_input_tokens", None)
         if cache_read_tokens is not None:
-            span.set_attribute("gen_ai.usage.cache_read_input_tokens", cache_read_tokens)
+            span.set_attribute("gen_ai.usage.cache_read.input_tokens", cache_read_tokens)
 
         cache_creation_tokens = getattr(token_usage, "cache_creation_input_tokens", None)
         if cache_creation_tokens is not None:
-            span.set_attribute("gen_ai.usage.cache_creation_input_tokens", cache_creation_tokens)
+            span.set_attribute("gen_ai.usage.cache_creation.input_tokens", cache_creation_tokens)
 
         reasoning_tokens = getattr(token_usage, "reasoning_tokens", None)
         if reasoning_tokens is not None:
@@ -182,11 +261,7 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
             span_name = "tts"
 
             # Get parent context
-            turn_context = get_current_turn_context()
-            conversation_context = get_current_conversation_context()
-            parent_context = (
-                turn_context or conversation_context or _get_parent_service_context(self)
-            )
+            parent_context = _get_turn_context(self) or _get_parent_service_context(self)
 
             # Create span
             tracer = trace.get_tracer("pipecat")
@@ -195,13 +270,14 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                     # Enable sharing public traces
                     span.set_attribute("langfuse.trace.public", True)
 
+                    settings = getattr(self, "_settings", None)
                     add_tts_span_attributes(
                         span=span,
                         service_name=service_class_name,
-                        model=getattr(self, "model_name") or "unknown",
-                        voice_id=getattr(self, "_voice_id", "unknown"),
+                        model=_get_model_name(self),
+                        voice_id=getattr(settings, "voice", "unknown"),
                         text=text,
-                        settings=getattr(self, "_settings", {}),
+                        settings=settings,
                         character_count=len(text),
                         operation_name="tts",
                         cartesia_version=getattr(self, "_cartesia_version", None),
@@ -223,19 +299,21 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
 
             @functools.wraps(f)
             async def gen_wrapper(self, text, *args, **kwargs):
-                try:
-                    # Check if tracing is enabled for this service instance
-                    if not getattr(self, "_tracing_enabled", False):
-                        async for item in f(self, text, *args, **kwargs):
-                            yield item
-                        return
+                if not getattr(self, "_tracing_enabled", False):
+                    async for item in f(self, text, *args, **kwargs):
+                        yield item
+                    return
 
+                fn_called = False
+                try:
                     async with tracing_context(self, text):
+                        fn_called = True
                         async for item in f(self, text, *args, **kwargs):
                             yield item
                 except Exception as e:
+                    if fn_called:
+                        raise
                     logger.error(f"Error in TTS tracing (continuing without tracing): {e}")
-                    # If tracing fails, fall back to the original function
                     async for item in f(self, text, *args, **kwargs):
                         yield item
 
@@ -244,16 +322,18 @@ def traced_tts(func: Optional[Callable] = None, *, name: Optional[str] = None) -
 
             @functools.wraps(f)
             async def wrapper(self, text, *args, **kwargs):
-                try:
-                    # Check if tracing is enabled for this service instance
-                    if not getattr(self, "_tracing_enabled", False):
-                        return await f(self, text, *args, **kwargs)
+                if not getattr(self, "_tracing_enabled", False):
+                    return await f(self, text, *args, **kwargs)
 
+                fn_called = False
+                try:
                     async with tracing_context(self, text):
+                        fn_called = True
                         return await f(self, text, *args, **kwargs)
                 except Exception as e:
+                    if fn_called:
+                        raise
                     logger.error(f"Error in TTS tracing (continuing without tracing): {e}")
-                    # If tracing fails, fall back to the original function
                     return await f(self, text, *args, **kwargs)
 
             return wrapper
@@ -286,20 +366,16 @@ def traced_stt(func: Optional[Callable] = None, *, name: Optional[str] = None) -
     def decorator(f):
         @functools.wraps(f)
         async def wrapper(self, transcript, is_final, language=None):
-            try:
-                # Check if tracing is enabled for this service instance
-                if not getattr(self, "_tracing_enabled", False):
-                    return await f(self, transcript, is_final, language)
+            if not getattr(self, "_tracing_enabled", False):
+                return await f(self, transcript, is_final, language)
 
+            fn_called = False
+            try:
                 service_class_name = self.__class__.__name__
                 span_name = "stt"
 
-                # Get the turn context first, then conversation context, then service context
-                turn_context = get_current_turn_context()
-                conversation_context = get_current_conversation_context()
-                parent_context = (
-                    turn_context or conversation_context or _get_parent_service_context(self)
-                )
+                # Get the turn context first, then fall back to service context
+                parent_context = _get_turn_context(self) or _get_parent_service_context(self)
 
                 # Create a new span as child of the turn span or service span
                 tracer = trace.get_tracer("pipecat")
@@ -316,12 +392,12 @@ def traced_stt(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                         )
 
                         # Use settings from the service if available
-                        settings = getattr(self, "_settings", {})
+                        settings = getattr(self, "_settings", None)
 
                         add_stt_span_attributes(
                             span=current_span,
                             service_name=service_class_name,
-                            model=getattr(self, "model_name") or settings.get("model", "unknown"),
+                            model=_get_model_name(self),
                             transcript=transcript,
                             is_final=is_final,
                             language=str(language) if language else None,
@@ -332,14 +408,16 @@ def traced_stt(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                         )
 
                         # Call the original function
+                        fn_called = True
                         return await f(self, transcript, is_final, language)
                     except Exception as e:
                         # Log any exception but don't disrupt the main flow
                         logger.warning(f"Error in STT transcription tracing: {e}")
                         raise
             except Exception as e:
+                if fn_called:
+                    raise
                 logger.error(f"Error in STT tracing (continuing without tracing): {e}")
-                # If tracing fails, fall back to the original function
                 return await f(self, transcript, is_final, language)
 
         return wrapper
@@ -347,6 +425,103 @@ def traced_stt(func: Optional[Callable] = None, *, name: Optional[str] = None) -
     if func is not None:
         return decorator(func)
     return decorator
+
+
+def _standardise_messages_to_chatml(messages):
+    """Standardise provider-native messages to ChatML format.
+
+    Messages already in ChatML format (no 'parts' key) pass through unchanged.
+    Currently handles Gemini format (parts/role:model).
+    """
+    if not messages:
+        return messages
+
+    chatml_messages = []
+    for msg in messages:
+        if not isinstance(msg, dict) or "parts" not in msg:
+            chatml_messages.append(msg)
+            continue
+
+        role = msg.get("role", "user")
+        parts = msg.get("parts", [])
+        chatml_role = "assistant" if role == "model" else role
+
+        text_parts = []
+        tool_calls = []
+
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if "text" in part:
+                text_parts.append(part["text"])
+            elif "function_call" in part:
+                fc = part["function_call"]
+                tool_calls.append(
+                    {
+                        "id": fc.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": fc.get("name", ""),
+                            "arguments": json.dumps(fc.get("args", {})),
+                        },
+                    }
+                )
+            elif "function_response" in part:
+                fr = part["function_response"]
+                chatml_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": fr.get("id", ""),
+                        "content": json.dumps(fr.get("response", {})),
+                    }
+                )
+                continue
+            elif "inline_data" in part:
+                text_parts.append("[inline_data]")
+            elif "file_data" in part:
+                text_parts.append("[file_data]")
+
+        if tool_calls:
+            chatml_msg = {"role": chatml_role, "tool_calls": tool_calls}
+            if text_parts:
+                chatml_msg["content"] = " ".join(text_parts)
+            chatml_messages.append(chatml_msg)
+        elif text_parts:
+            content = text_parts[0] if len(text_parts) == 1 else " ".join(text_parts)
+            chatml_messages.append({"role": chatml_role, "content": content})
+
+    return chatml_messages
+
+
+def _standardise_tools_to_chatml(tools):
+    """Standardise provider-native tools to ChatML format.
+
+    Tools already in ChatML format pass through unchanged.
+    Currently handles Gemini format (function_declarations).
+    """
+    if not tools:
+        return tools
+
+    chatml_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if "type" in tool and tool["type"] == "function":
+            chatml_tools.append(tool)
+            continue
+        for decl in tool.get("function_declarations", []):
+            chatml_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": decl.get("name", ""),
+                        "description": decl.get("description", ""),
+                        "parameters": decl.get("parameters", {}),
+                    },
+                }
+            )
+
+    return chatml_tools
 
 
 def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -> Callable:
@@ -374,38 +549,33 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
     def decorator(f):
         @functools.wraps(f)
         async def wrapper(self, context, *args, **kwargs):
-            try:
-                # Check if tracing is enabled for this service instance
-                if not getattr(self, "_tracing_enabled", False):
-                    return await f(self, context, *args, **kwargs)
+            if not getattr(self, "_tracing_enabled", False):
+                return await f(self, context, *args, **kwargs)
 
+            fn_called = False
+            try:
                 service_class_name = self.__class__.__name__
+                span_name = "llm"
 
                 # Build the span name. If a custom name was supplied to the decorator we
                 # honour that. Otherwise, if the provided context exposes a node name we
                 # append it to the default "llm" prefix so that the span becomes
                 # "llm-{node_name}".
-                span_name = "llm"
                 if name is not None:
                     span_name += f"-{name}"
                 else:
-                    node_name = None
+                    otel_span_name = None
                     try:
-                        node_name = context.get_node_name()
+                        otel_span_name = context.get_otel_span_name()
                     except AttributeError:
-                        node_name = None
+                        otel_span_name = None
 
-                    if node_name:
+                    if otel_span_name:
                         # Replace whitespace with hyphens for cleaner span names.
-                        node_slug = str(node_name).replace(" ", "-").lower()[:20]
-                        span_name += f"-{node_slug}"
+                        span_name = str(otel_span_name).replace(" ", "-").lower()[:20]
 
-                # Get the parent context - turn context if available, then conversation context, then service context
-                turn_context = get_current_turn_context()
-                conversation_context = get_current_conversation_context()
-                parent_context = (
-                    turn_context or conversation_context or _get_parent_service_context(self)
-                )
+                # Get the parent context - turn context if available, otherwise service context
+                parent_context = _get_turn_context(self) or _get_parent_service_context(self)
 
                 # Create a new span as child of the turn span or service span
                 tracer = trace.get_tracer("pipecat")
@@ -418,7 +588,6 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
 
                         # Store original method and output aggregator
                         original_push_frame = self.push_frame
-                        # Accumulator for plain text tokens streamed by the LLM
                         output_text = ""  # Simple string accumulation
 
                         # Accumulator for function call information emitted during the
@@ -427,9 +596,7 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
 
                         async def traced_push_frame(frame, direction=None):
                             nonlocal output_text, function_calls_info
-                            # ------------------------------------------------------------------
-                            # Capture text tokens streamed by the LLM
-                            # ------------------------------------------------------------------
+                            # Capture text from LLMTextFrame during streaming
                             if (
                                 hasattr(frame, "__class__")
                                 and frame.__class__.__name__ == "LLMTextFrame"
@@ -437,10 +604,7 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                             ):
                                 output_text += frame.text
 
-                            # ------------------------------------------------------------------
-                            # Capture function call frames so that we can record the
-                            # function name and its arguments in the tracing span.
-                            # ------------------------------------------------------------------
+                            # Capture function calls from FunctionCallsFromLLMInfoFrame
                             if (
                                 hasattr(frame, "__class__")
                                 and frame.__class__.__name__ == "FunctionCallsFromLLMInfoFrame"
@@ -454,7 +618,9 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                                                 "function_name": getattr(
                                                     call, "function_name", None
                                                 ),
-                                                "tool_call_id": getattr(call, "tool_call_id", None),
+                                                "tool_call_id": _strip_thought_from_id(
+                                                    getattr(call, "tool_call_id", None)
+                                                ),
                                                 "arguments": getattr(call, "arguments", None),
                                             }
                                         )
@@ -502,6 +668,7 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                                 if hasattr(self, "get_llm_adapter"):
                                     adapter = self.get_llm_adapter()
                                     messages = adapter.get_messages_for_logging(context)
+                                    messages = _standardise_messages_to_chatml(messages)
 
                             # Get tools
                             # For OpenAILLMContext: tools may need adapter conversion if set
@@ -516,54 +683,74 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                                 if hasattr(self, "get_llm_adapter") and hasattr(context, "tools"):
                                     adapter = self.get_llm_adapter()
                                     tools = adapter.from_standard_tools(context.tools)
+                                    tools = _standardise_tools_to_chatml(tools)
 
                             # Handle system message for different services
                             system_message = None
-                            if hasattr(context, "system"):
+                            if isinstance(context, LLMContext):
+                                # settings.system_instruction takes priority (matches service behavior)
+                                if hasattr(self, "_settings") and getattr(
+                                    self._settings, "system_instruction", None
+                                ):
+                                    system_message = self._settings.system_instruction
+                                else:
+                                    # Fall back to extracting from context messages
+                                    ctx_messages = context.get_messages()
+                                    if ctx_messages:
+                                        first = ctx_messages[0]
+                                        if (
+                                            isinstance(first, dict)
+                                            and first.get("role") == "system"
+                                        ):
+                                            content = first.get("content")
+                                            if isinstance(content, str):
+                                                system_message = content
+                                            elif isinstance(content, list):
+                                                system_message = " ".join(
+                                                    part.get("text", "")
+                                                    for part in content
+                                                    if isinstance(part, dict)
+                                                    and part.get("type") == "text"
+                                                )
+                            elif hasattr(context, "system"):
                                 system_message = context.system
                             elif hasattr(context, "system_message"):
                                 system_message = context.system_message
-                            elif hasattr(self, "_system_instruction"):
-                                system_message = self._system_instruction
 
-                            # --------------------------------------------------
-                            # Combine the system message with the conversation messages so that
-                            # they are emitted as a single `messages` span attribute
-                            # --------------------------------------------------
-                            try:
-                                if system_message is not None:
-                                    messages = [
-                                        {"role": "system", "content": system_message}
-                                    ] + messages
-                            except Exception as e:
-                                logger.error("Error serializing messages")
-                                messages = f"Error serializing messages: {str(e)}"
+                            # Prepend system message as first message
+                            if system_message and isinstance(messages, list):
+                                if not messages or messages[0].get("role") != "system":
+                                    messages.insert(
+                                        0, {"role": "system", "content": system_message}
+                                    )
 
-                            # Get settings from the service
+                            # Use given_fields() defensively in case a service doesn't
+                            # initialize all settings.
                             params = {}
                             if hasattr(self, "_settings"):
-                                for key, value in self._settings.items():
-                                    if key == "extra":
+                                for key, value in self._settings.given_fields().items():
+                                    # system_instruction is already captured as the
+                                    # "system_instructions" span attribute above.
+                                    if key == "system_instruction":
                                         continue
-                                    # Add value directly if it's a basic type
                                     if isinstance(value, (int, float, bool, str)):
                                         params[key] = value
-                                    elif value is None or (
-                                        hasattr(value, "__name__") and value.__name__ == "NOT_GIVEN"
-                                    ):
+                                    elif value is None:
                                         params[key] = "NOT_GIVEN"
 
                             # Add all available attributes to the span
                             attribute_kwargs = {
                                 "service_name": service_class_name,
-                                "model": getattr(self, "model_name", "")
-                                or getattr(self, "_full_model_name", "unknown"),
+                                "model": _get_model_name(self),
                                 "stream": True,  # Most LLM services use streaming
                                 "parameters": params,
                             }
 
                             # Add optional attributes only if they exist
-                            attribute_kwargs["messages"] = messages
+                            # Strip __thought__ from tool_call_ids in messages
+                            attribute_kwargs["messages"] = (
+                                _strip_thought_ids_from_messages(messages) if messages else messages
+                            )
                             attribute_kwargs["tools"] = tools
 
                             # Add all gathered attributes to the span
@@ -574,14 +761,12 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                             # Don't raise - let the function execute anyway
 
                         # Run function with modified push_frame to capture the output
+                        fn_called = True
                         result = await f(self, context, *args, **kwargs)
 
-                        # --------------------------------------------------------------
                         # Append JSON dump of function calls to the output text so that
                         # the consumer can see both in a single attribute.
-                        # --------------------------------------------------------------
                         span_output = {"content": output_text}
-
                         if function_calls_info:
                             span_output["tool_calls"] = function_calls_info
 
@@ -609,8 +794,9 @@ def traced_llm(func: Optional[Callable] = None, *, name: Optional[str] = None) -
                         if ttfb is not None:
                             current_span.set_attribute("metrics.ttfb", ttfb)
             except Exception as e:
+                if fn_called:
+                    raise
                 logger.error(f"Error in LLM tracing (continuing without tracing): {e}")
-                # If tracing fails, fall back to the original function
                 return await f(self, context, *args, **kwargs)
 
         return wrapper
@@ -642,20 +828,16 @@ def traced_gemini_live(operation: str) -> Callable:
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(self, *args, **kwargs):
-            try:
-                # Check if tracing is enabled for this service instance
-                if not getattr(self, "_tracing_enabled", False):
-                    return await func(self, *args, **kwargs)
+            if not getattr(self, "_tracing_enabled", False):
+                return await func(self, *args, **kwargs)
 
+            fn_called = False
+            try:
                 service_class_name = self.__class__.__name__
                 span_name = f"{operation}"
 
-                # Get the parent context - turn context if available, then conversation context, then service context
-                turn_context = get_current_turn_context()
-                conversation_context = get_current_conversation_context()
-                parent_context = (
-                    turn_context or conversation_context or _get_parent_service_context(self)
-                )
+                # Get the parent context - turn context if available, otherwise service context
+                parent_context = _get_turn_context(self) or _get_parent_service_context(self)
 
                 # Create a new span as child of the turn span or service span
                 tracer = trace.get_tracer("pipecat")
@@ -667,19 +849,15 @@ def traced_gemini_live(operation: str) -> Callable:
                         current_span.set_attribute("langfuse.trace.public", True)
 
                         # Base service attributes
-                        model_name = (
-                            getattr(self, "model_name", None)
-                            or getattr(self, "_model_name", None)
-                            or "unknown"
-                        )
+                        model_name = _get_model_name(self)
                         voice_id = getattr(self, "_voice_id", None)
                         language_code = getattr(self, "_language_code", None)
-                        settings = getattr(self, "_settings", {})
+                        settings = getattr(self, "_settings", None)
 
                         # Get modalities if available
                         modalities = None
-                        if hasattr(self, "_settings") and "modalities" in self._settings:
-                            modality_obj = self._settings["modalities"]
+                        if settings and hasattr(settings, "modalities"):
+                            modality_obj = settings.modalities
                             if hasattr(modality_obj, "value"):
                                 modalities = modality_obj.value
                             else:
@@ -759,19 +937,6 @@ def traced_gemini_live(operation: str) -> Callable:
                                 operation_attrs["system_instruction"] = system_instruction[
                                     :500
                                 ]  # Truncate if very long
-
-                            # Capture context system instructions if available
-                            if hasattr(self, "_context") and self._context:
-                                try:
-                                    context_system = self._context.extract_system_instructions()
-                                    if context_system:
-                                        operation_attrs["context_system_instruction"] = (
-                                            context_system[:500]
-                                        )  # Truncate if very long
-                                except Exception as e:
-                                    logger.warning(
-                                        f"Error extracting context system instructions: {e}"
-                                    )
 
                         elif operation == "llm_tool_call" and args:
                             # Extract tool call information
@@ -915,6 +1080,7 @@ def traced_gemini_live(operation: str) -> Callable:
                             current_span.set_attribute("metrics.ttfb", ttfb)
 
                         # Run the original function
+                        fn_called = True
                         result = await func(self, *args, **kwargs)
 
                         return result
@@ -925,8 +1091,9 @@ def traced_gemini_live(operation: str) -> Callable:
                         raise
 
             except Exception as e:
+                if fn_called:
+                    raise
                 logger.error(f"Error in Gemini Live tracing (continuing without tracing): {e}")
-                # If tracing fails, fall back to the original function
                 return await func(self, *args, **kwargs)
 
         return wrapper
@@ -955,20 +1122,16 @@ def traced_openai_realtime(operation: str) -> Callable:
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(self, *args, **kwargs):
-            try:
-                # Check if tracing is enabled for this service instance
-                if not getattr(self, "_tracing_enabled", False):
-                    return await func(self, *args, **kwargs)
+            if not getattr(self, "_tracing_enabled", False):
+                return await func(self, *args, **kwargs)
 
+            fn_called = False
+            try:
                 service_class_name = self.__class__.__name__
                 span_name = f"{operation}"
 
-                # Get the parent context - turn context if available, then conversation context, then service context
-                turn_context = get_current_turn_context()
-                conversation_context = get_current_conversation_context()
-                parent_context = (
-                    turn_context or conversation_context or _get_parent_service_context(self)
-                )
+                # Get the parent context - turn context if available, otherwise service context
+                parent_context = _get_turn_context(self) or _get_parent_service_context(self)
 
                 # Create a new span as child of the turn span or service span
                 tracer = trace.get_tracer("pipecat")
@@ -980,11 +1143,7 @@ def traced_openai_realtime(operation: str) -> Callable:
                         current_span.set_attribute("langfuse.trace.public", True)
 
                         # Base service attributes
-                        model_name = (
-                            getattr(self, "model_name", None)
-                            or getattr(self, "_model_name", None)
-                            or "unknown"
-                        )
+                        model_name = _get_model_name(self)
 
                         # Operation-specific attribute collection
                         operation_attrs = {}
@@ -1145,6 +1304,7 @@ def traced_openai_realtime(operation: str) -> Callable:
                                 current_span.set_attribute("metrics.ttfb", ttfb)
 
                         # Run the original function
+                        fn_called = True
                         result = await func(self, *args, **kwargs)
 
                         return result
@@ -1155,8 +1315,9 @@ def traced_openai_realtime(operation: str) -> Callable:
                         raise
 
             except Exception as e:
+                if fn_called:
+                    raise
                 logger.error(f"Error in OpenAI Realtime tracing (continuing without tracing): {e}")
-                # If tracing fails, fall back to the original function
                 return await func(self, *args, **kwargs)
 
         return wrapper

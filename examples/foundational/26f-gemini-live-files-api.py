@@ -10,8 +10,6 @@ import tempfile
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -28,27 +26,23 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 load_dotenv(override=True)
 
 
-# We store functions so objects (e.g. SileroVADAnalyzer) don't get
-# instantiated. The function will be called when the desired transport gets
-# selected.
+# We use lambdas to defer transport parameter creation until the transport
+# type is selected at runtime.
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
         video_in_enabled=False,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
         video_in_enabled=False,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
         video_in_enabled=False,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
     ),
 }
 
@@ -111,9 +105,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # Initialize Gemini service with File API support
     llm = GeminiLiveLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
-        system_instruction=system_instruction,
-        voice_id="Charon",  # Aoede, Charon, Fenrir, Kore, Puck
-        transcribe_user_audio=True,
+        settings=GeminiLiveLLMService.Settings(
+            system_instruction=system_instruction,
+            voice="Charon",  # Aoede, Charon, Fenrir, Kore, Puck
+        ),
     )
 
     # Upload the sample file to Gemini File API
@@ -133,7 +128,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         context = LLMContext(
             [
                 {
-                    "role": "user",
+                    "role": "developer",
                     "content": [
                         {
                             "type": "text",
@@ -156,13 +151,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         context = LLMContext(
             [
                 {
-                    "role": "user",
+                    "role": "developer",
                     "content": "Greet the user and explain that there was an issue with file upload, but you're ready to help with other tasks.",
                 }
             ]
         )
 
-    # Create context aggregator
+    # Server-side VAD is enabled by default; no local VAD is added.
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
 
     # Build the pipeline

@@ -14,9 +14,7 @@ from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame, UserImageRequestFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -39,8 +37,6 @@ from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 load_dotenv(override=True)
 
@@ -66,7 +62,8 @@ async def get_image(params: FunctionCallParams):
     logger.debug(f"Requesting image with user_id={user_id}, question={question}")
 
     # Request a user image frame and indicate that it should be added to the
-    # context. Also associate it to the function call.
+    # context. Also associate it to the function call. Pass the result_callback
+    # so it can be invoked when the image is actually retrieved.
     await params.llm.push_frame(
         UserImageRequestFrame(
             user_id=user_id,
@@ -74,15 +71,10 @@ async def get_image(params: FunctionCallParams):
             append_to_context=True,
             function_name=params.function_name,
             tool_call_id=params.tool_call_id,
+            result_callback=params.result_callback,
         ),
         FrameDirection.UPSTREAM,
     )
-
-    await params.result_callback(None)
-
-    # Instead of None, it's possible to also provide a tool call answer to
-    # tell the LLM that we are grabbing the image to analyze.
-    # await params.result_callback({"result": "Image is being captured."})
 
 
 async def get_saved_conversation_filenames(params: FunctionCallParams):
@@ -130,12 +122,8 @@ async def load_conversation(params: FunctionCallParams):
         await params.result_callback({"success": False, "error": str(e)})
 
 
-# Test message munging ...
-messages = [
-    {
-        "role": "system",
-        "content": """You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your
-capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that
+system_instruction = """You are a helpful assistant in a voice conversation. Your goal is to demonstrate your
+capabilities in a succinct way. Your responses will be spoken aloud, so avoid emojis, bullet points, or other formatting that can't be spoken. Keep responses concise. Respond to what the user said in a creative
 can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative
 and helpful way.
 
@@ -159,13 +147,7 @@ indicate you should use the get_image tool are:
   - Tell me about what you see.
   - Tell me something interesting about what you see.
   - What's happening in the video?
-        """,
-    },
-    # {"role": "user", "content": ""},
-    # {"role": "assistant", "content": []},
-    # {"role": "user", "content": "Tell me"},
-    # {"role": "user", "content": "a joke"},
-]
+"""
 
 weather_function = FunctionSchema(
     name="get_current_weather",
@@ -242,21 +224,18 @@ tools = ToolsSchema(
 )
 
 
-# We store functions so objects (e.g. SileroVADAnalyzer) don't get
-# instantiated. The function will be called when the desired transport gets
-# selected.
+# We use lambdas to defer transport parameter creation until the transport
+# type is selected at runtime.
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
         video_in_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
         video_in_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
     ),
 }
 
@@ -268,10 +247,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+        settings=CartesiaTTSService.Settings(
+            voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+        ),
     )
 
-    llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"))
+    llm = GoogleLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        system_instruction=system_instruction,
+    )
 
     # you can either register a single function for all function calls, or specific functions
     # llm.register_function(None, fetch_weather_from_api)
@@ -281,14 +265,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     llm.register_function("load_conversation", load_conversation)
     llm.register_function("get_image", get_image)
 
-    context = LLMContext(messages, tools)
+    context = LLMContext(tools=tools)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            user_turn_strategies=UserTurnStrategies(
-                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())]
-            ),
-        ),
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
     pipeline = Pipeline(
@@ -321,9 +301,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         client_id = get_transport_client_id(transport, client)
 
         # Kick off the conversation.
-        messages.append(
+        context.add_message(
             {
-                "role": "system",
+                "role": "developer",
                 "content": f"Please introduce yourself to the user. Use '{client_id}' as the user ID during function calls.",
             }
         )

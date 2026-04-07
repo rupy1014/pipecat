@@ -23,9 +23,11 @@ from pydantic import BaseModel
 
 from pipecat.frames.frames import (
     CancelFrame,
+    ClientConnectedFrame,
     EndFrame,
     Frame,
     InputAudioRawFrame,
+    InputTransportMessageFrame,
     InterruptionFrame,
     OutputAudioRawFrame,
     OutputTransportMessageFrame,
@@ -37,6 +39,7 @@ from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.utils.enums import EndTaskReason
 
 try:
     from fastapi import WebSocket
@@ -118,6 +121,7 @@ class FastAPIWebsocketClient:
         self._closing = False
         self._callbacks = callbacks
         self._leave_counter = 0
+        self._transfer_in_progress = False
 
     async def setup(self, _: StartFrame):
         """Set up the WebSocket client.
@@ -151,14 +155,6 @@ class FastAPIWebsocketClient:
             logger.warning(
                 f"{self} exception sending data: {e.__class__.__name__} ({e}), application_state: {self._websocket.application_state}"
             )
-            # For some reason the websocket is disconnected, and we are not able to send data
-            # So let's properly handle it and disconnect the transport if it is not already disconnecting
-            if (
-                self._websocket.application_state == WebSocketState.DISCONNECTED
-                and not self.is_closing
-            ):
-                logger.warning("Closing already disconnected websocket!")
-                self._closing = True
 
     async def disconnect(self):
         """Disconnect the WebSocket client."""
@@ -187,7 +183,11 @@ class FastAPIWebsocketClient:
 
     def _can_send(self):
         """Check if data can be sent through the WebSocket."""
-        return self.is_connected and not self.is_closing
+        return (
+            self.is_connected
+            and not self.is_closing
+            and self._websocket.application_state != WebSocketState.DISCONNECTED
+        )
 
     @property
     def is_connected(self) -> bool:
@@ -259,6 +259,7 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
         if not self._monitor_websocket_task and self._params.session_timeout:
             self._monitor_websocket_task = self.create_task(self._monitor_websocket())
         await self._client.trigger_client_connected()
+        await self.push_frame(ClientConnectedFrame())
         if not self._receive_task:
             self._receive_task = self.create_task(self._receive_messages())
         await self.set_transport_ready(frame)
@@ -311,6 +312,8 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
 
                 if isinstance(frame, InputAudioRawFrame):
                     await self.push_audio_frame(frame)
+                elif isinstance(frame, InputTransportMessageFrame):
+                    await self.broadcast_frame(InputTransportMessageFrame, message=frame.message)
                 else:
                     await self.push_frame(frame)
         except Exception as e:
@@ -318,7 +321,7 @@ class FastAPIWebsocketInputTransport(BaseInputTransport):
 
         # Trigger `on_client_disconnected` if the client actually disconnects,
         # that is, we are not the ones disconnecting.
-        if not self._client.is_closing:
+        if not self._client.is_closing and not self._client._transfer_in_progress:
             await self._client.trigger_client_disconnected()
 
     async def _monitor_websocket(self):
@@ -400,6 +403,12 @@ class FastAPIWebsocketOutputTransport(BaseOutputTransport):
             frame: The end frame signaling transport shutdown.
         """
         await super().stop(frame)
+
+        # Lets mark transfer in progress in client, so that we dont call on_client_disconnected
+        # handler if
+        if isinstance(frame, EndFrame) and frame.reason == EndTaskReason.TRANSFER_CALL.value:
+            self._client._transfer_in_progress = True
+
         await self._write_frame(frame)
         await self._client.disconnect()
 
@@ -531,6 +540,18 @@ class FastAPIWebsocketTransport(BaseTransport):
 
     Provides bidirectional WebSocket communication with frame serialization,
     session management, and event handling for client connections and timeouts.
+
+    Event handlers available:
+
+    - on_client_connected(transport, websocket): Client WebSocket connected
+    - on_client_disconnected(transport, websocket): Client WebSocket disconnected
+    - on_session_timeout(transport, websocket): Session timed out
+
+    Example::
+
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, websocket):
+            ...
     """
 
     def __init__(

@@ -11,6 +11,7 @@ from typing import Optional, Type
 
 from pipecat.frames.frames import (
     Frame,
+    InterimTranscriptionFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -18,7 +19,11 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.turns.user_start import BaseUserTurnStartStrategy, UserTurnStartedParams
+from pipecat.turns.types import ProcessFrameResult
+from pipecat.turns.user_start import (
+    BaseUserTurnStartStrategy,
+    UserTurnStartedParams,
+)
 from pipecat.turns.user_stop import BaseUserTurnStopStrategy, UserTurnStoppedParams
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.asyncio.task_manager import BaseTaskManager
@@ -93,6 +98,7 @@ class UserTurnController(BaseObject):
         self._register_event_handler("on_user_turn_started", sync=True)
         self._register_event_handler("on_user_turn_stopped", sync=True)
         self._register_event_handler("on_user_turn_stop_timeout", sync=True)
+        self._register_event_handler("on_reset_aggregation", sync=True)
 
     @property
     def task_manager(self) -> BaseTaskManager:
@@ -156,14 +162,18 @@ class UserTurnController(BaseObject):
             await self._handle_vad_user_started_speaking(frame)
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             await self._handle_vad_user_stopped_speaking(frame)
-        elif isinstance(frame, TranscriptionFrame):
+        elif isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
             await self._handle_transcription(frame)
 
         for strategy in self._user_turn_strategies.start or []:
-            await strategy.process_frame(frame)
+            result = await strategy.process_frame(frame)
+            if result == ProcessFrameResult.STOP:
+                break
 
         for strategy in self._user_turn_strategies.stop or []:
-            await strategy.process_frame(frame)
+            result = await strategy.process_frame(frame)
+            if result == ProcessFrameResult.STOP:
+                break
 
     async def _setup_strategies(self):
         for s in self._user_turn_strategies.start or []:
@@ -171,6 +181,7 @@ class UserTurnController(BaseObject):
             s.add_event_handler("on_push_frame", self._on_push_frame)
             s.add_event_handler("on_broadcast_frame", self._on_broadcast_frame)
             s.add_event_handler("on_user_turn_started", self._on_user_turn_started)
+            s.add_event_handler("on_reset_aggregation", self._on_reset_aggregation)
 
         for s in self._user_turn_strategies.stop or []:
             await s.setup(self.task_manager)
@@ -209,8 +220,8 @@ class UserTurnController(BaseObject):
         # The user stopped talking, let's reset the user turn timeout.
         self._user_turn_stop_timeout_event.set()
 
-    async def _handle_transcription(self, frame: TranscriptionFrame):
-        # We have creceived a transcription, let's reset the user turn timeout.
+    async def _handle_transcription(self, frame: TranscriptionFrame | InterimTranscriptionFrame):
+        # We have received a transcription, let's reset the user turn timeout.
         self._user_turn_stop_timeout_event.set()
 
     async def _on_push_frame(
@@ -241,6 +252,9 @@ class UserTurnController(BaseObject):
     ):
         await self._trigger_user_turn_stop(strategy, params)
 
+    async def _on_reset_aggregation(self, strategy: BaseUserTurnStartStrategy):
+        await self._call_event_handler("on_reset_aggregation", strategy)
+
     async def _trigger_user_turn_start(
         self, strategy: Optional[BaseUserTurnStartStrategy], params: UserTurnStartedParams
     ):
@@ -253,6 +267,10 @@ class UserTurnController(BaseObject):
 
         # Reset all user turn start strategies to start fresh.
         for s in self._user_turn_strategies.start or []:
+            await s.reset()
+
+        # Reset all user turn stop strategies to start fresh for the new turn.
+        for s in self._user_turn_strategies.stop or []:
             await s.reset()
 
         await self._call_event_handler("on_user_turn_started", strategy, params)
