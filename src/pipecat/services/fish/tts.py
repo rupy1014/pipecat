@@ -170,6 +170,29 @@ class FishAudioTTSService(InterruptibleTTSService):
         await self._disconnect()
         await self._connect()
 
+    def set_voice(self, voice: str):
+        """Set the voice (reference_id) and schedule reconnection.
+
+        Fish Audio uses reference_id in the WebSocket start message,
+        so we must update _settings and reconnect for the change to take effect.
+
+        Args:
+            voice: The Fish Audio reference_id (voice model ID).
+        """
+        super().set_voice(voice)
+        old_ref = self._settings.get("reference_id")
+        self._settings["reference_id"] = voice
+        if old_ref != voice:
+            logger.info(f"Fish Audio voice changed: {old_ref} -> {voice}, will reconnect")
+            self._voice_changed = True
+
+    async def _connect_with_voice_change(self):
+        """Reconnect WebSocket if voice was changed via set_voice()."""
+        if getattr(self, "_voice_changed", False):
+            self._voice_changed = False
+            await self._disconnect()
+            await self._connect()
+
     async def start(self, frame: StartFrame):
         """Start the Fish Audio TTS service.
 
@@ -308,6 +331,9 @@ class FishAudioTTSService(InterruptibleTTSService):
         """
         logger.debug(f"{self}: Generating Fish TTS: [{text}]")
         try:
+            # Reconnect if voice was changed via set_voice()
+            await self._connect_with_voice_change()
+
             if not self._websocket or self._websocket.state is State.CLOSED:
                 await self._connect()
 
